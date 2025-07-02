@@ -4,14 +4,14 @@ The goal of the project is to build a RAG + pre-trained BART pipeline for automa
 
 ## Getting Started
 
-### 1. Clone the repository
+### 0. Clone the repository
 
 ```bash
 git clone https://github.com/VladimirZelenokor1/SciSumm-RAG
 cd SciSumm-RAG
 ```
 
-### 2. Create a virtual environment and activate it
+### 1. Create a virtual environment and activate it
 
 MacOS / Linux:
     
@@ -25,6 +25,11 @@ Windows:
 
 python -m venv venv
 venv\scripts\activate
+```
+
+### 2. Put your kaggle.json in the project root & Run
+```bash
+python src/data/setup_kaggle.py
 ```
 
 ### 3. Install dependencies
