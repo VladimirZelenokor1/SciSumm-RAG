@@ -14,7 +14,7 @@ cd SciSumm-RAG
 ### 2. Create a virtual environment and activate it
 
 MacOS / Linux:
-
+    
 ```bash
 python -m venv venv
 source venv/bin/activate
