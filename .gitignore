@@ -1,5 +1,9 @@
 .idea/
 venv/
+/data/**
+!/data
+!/data/**/
+!/data/**/.gitkeep
 .env
 __pycache__/
 *.pyc
