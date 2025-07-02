@@ -46,3 +46,10 @@ Create a file named .env in the root of the project and add your keys:
 ### Features
 
 ### Notes
+
+### Important
+
+```bash
+Python == 3.12.5
+pip
+```
