@@ -8,3 +8,7 @@ sentence-transformers
 torch
 tiktoken
 rake_nltk
+matplotlib
+wordcloud
+seaborn
+tqdm
