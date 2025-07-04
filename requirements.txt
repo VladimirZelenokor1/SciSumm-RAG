@@ -2,13 +2,12 @@ kaggle
 numpy
 pandas
 pytest
-faiss-cpu
 nltk
 sentence-transformers
-torch
 tiktoken
 rake_nltk
 matplotlib
 wordcloud
 seaborn
 tqdm
+faiss-cpu

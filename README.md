@@ -34,6 +34,7 @@ python src/data/setup_kaggle.py
 
 ### 3. Install dependencies
 ```bash
+pip install torch --index-url https://download.pytorch.org/whl/cu118 
 pip install -r requirements.txt
 ```
 

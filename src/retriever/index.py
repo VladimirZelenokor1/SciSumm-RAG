@@ -1,20 +1,23 @@
 import numpy as np
 import json
 import faiss
+import pickle
 from pathlib import Path
 from typing import List, Tuple, Dict
 import argparse
-import torch
 from sentence_transformers import CrossEncoder
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# CPU-only FAISS indexer for RAG pipeline
 
 
 def load_embeddings(path_vec: Path, path_ids: Path) -> Tuple[List[Tuple[str,str,str]], np.ndarray]:
     vectors = np.load(path_vec)  # shape (N, D)
     with open(path_ids, "r", encoding="utf-8") as f:
         ids = json.load(f)
-    assert len(ids) == vectors.shape[0], "IDs and vectors count mismatch"
+    if len(ids) != vectors.shape[0]:
+        raise ValueError("Mismatch between IDs and embedding vectors: {} vs {}".format(
+            len(ids), vectors.shape[0]
+        ))
     return ids, vectors
 
 
@@ -23,39 +26,25 @@ def normalize_embeddings(vectors: np.ndarray) -> np.ndarray:
     return vectors / np.clip(norm, 1e-12, None)
 
 
-def build_flat_index(
-    vectors: np.ndarray, metric: str = "IP", use_gpu: bool = False
-) -> faiss.Index:
+def build_flat_index(vectors: np.ndarray, metric: str = "IP") -> faiss.Index:
     D = vectors.shape[1]
     if metric == "IP":
-        cpu_index = faiss.IndexFlatIP(D)
+        index = faiss.IndexFlatIP(D)
+    elif metric == "L2":
+        index = faiss.IndexFlatL2(D)
     else:
-        cpu_index = faiss.IndexFlatL2(D)
-    if use_gpu:
-        res = faiss.StandardGpuResources()
-        index = faiss.index_cpu_to_gpu(res, 0, cpu_index)
-    else:
-        index = cpu_index
+        raise ValueError(f"Unsupported metric: {metric}")
     index.add(vectors)
     return index
 
 
-def build_hnsw_index(
-    vectors: np.ndarray,
-    M: int = 32,
-    efC: int = 200,
-    efS: int = 50,
-    use_gpu: bool = False
-) -> faiss.Index:
+def build_hnsw_index(vectors: np.ndarray, M: int = 64, efC: int = 200, efS: int = 200) -> faiss.Index:
     D = vectors.shape[1]
-    cpu_index = faiss.IndexHNSWFlat(D, M)
-    cpu_index.hnsw.efConstruction = efC
-    cpu_index.add(vectors)
-    cpu_index.hnsw.efSearch = efS
-    if use_gpu:
-        res = faiss.StandardGpuResources()
-        return faiss.index_cpu_to_gpu(res, 0, cpu_index)
-    return cpu_index
+    index = faiss.IndexHNSWFlat(D, M)
+    index.hnsw.efConstruction = efC
+    index.add(vectors)
+    index.hnsw.efSearch = efS
+    return index
 
 
 def apply_opq(vectors: np.ndarray, M: int = 64) -> Tuple[np.ndarray, faiss.OPQMatrix]:
@@ -67,65 +56,101 @@ def apply_opq(vectors: np.ndarray, M: int = 64) -> Tuple[np.ndarray, faiss.OPQMa
 
 def build_ivfopq_index(
     vectors: np.ndarray,
-    nlist: int = 1024,
+    index_out: Path,
+    nlist: int = 4096,
     m: int = 64,
-    nbits: int = 8,
-    use_gpu: bool = False
+    nbits: int = 8
 ) -> faiss.Index:
-    # OPQ + IVF-PQ
+    """
+    Построить OPQ + IVF-PQ индекс и сохранить OPQ-матрицу рядом с индексом.
+
+    :param vectors: корпус эмбеддингов, shape (N, D)
+    :param index_out: полный путь до .index файла (например data/index/faiss_ivfopq.index)
+    :param nlist: число кластеров для IVF
+    :param m: число суб-векторов для PQ и OPQ
+    :param nbits: число бит на суб-вектор в PQ
+    :returns: построенный faiss.IndexIVFPQ
+    """
+    # 1) Обучаем OPQ и трансформируем корпус
     v_opq, opq_mat = apply_opq(vectors, M=m)
+
+    # 2) Подготавливаем директорию и сохраняем OPQ-матрицу
+    index_out = Path(index_out)
+    index_out.parent.mkdir(parents=True, exist_ok=True)
+    opq_path = index_out.with_suffix(".opq")  # e.g. data/index/faiss_ivfopq.opq
+    faiss.write_VectorTransform(opq_mat, str(opq_path))
+
+    # 3) Строим IVF-PQ на OPQ-векторах
     D = v_opq.shape[1]
     quantizer = faiss.IndexFlatIP(D)
-    cpu_index = faiss.IndexIVFPQ(quantizer, D, nlist, m, nbits)
-    cpu_index.train(v_opq)
-    cpu_index.add(v_opq)
-    if use_gpu:
-        res = faiss.StandardGpuResources()
-        return faiss.index_cpu_to_gpu(res, 0, cpu_index)
-    return cpu_index
+    ivfpq_idx = faiss.IndexIVFPQ(quantizer, D, nlist, m, nbits)
+    ivfpq_idx.train(v_opq)
+    ivfpq_idx.add(v_opq)
+
+    return ivfpq_idx
 
 
-def save_index(
-    index: faiss.Index,
-    ids: List[Tuple[str,str,str]],
-    index_path: Path,
-    ids_path: Path
-):
-    # convert to CPU before saving
-    if isinstance(index, faiss.GpuIndex):
-        index = faiss.index_gpu_to_cpu(index)
+def save_index(index: faiss.Index, ids: List[Tuple[str, str, str]], index_path: Path, ids_path: Path):
+    # FAISS CPU-only, direct save
+    index_path.parent.mkdir(parents=True, exist_ok=True)
     faiss.write_index(index, str(index_path))
     with open(ids_path, "w", encoding="utf-8") as f:
         json.dump(ids, f, ensure_ascii=False)
 
 
-def load_index(
-    index_path: Path,
-    ids_path: Path,
-    use_gpu: bool = False
-) -> Tuple[faiss.Index, List[Tuple[str,str,str]]]:
-    cpu_index = faiss.read_index(str(index_path))
-    if use_gpu:
-        res = faiss.StandardGpuResources()
-        index = faiss.index_cpu_to_gpu(res, 0, cpu_index)
-    else:
-        index = cpu_index
+def load_index(index_path: Path, ids_path: Path) -> Tuple[faiss.Index, List[Tuple[str, str, str]]]:
+    index = faiss.read_index(str(index_path))
     with open(ids_path, "r", encoding="utf-8") as f:
         ids = json.load(f)
     return index, ids
 
 
-def search(
+def retrieve_candidates(
     index: faiss.Index,
     ids: List[Tuple[str,str,str]],
     queries: np.ndarray,
-    top_k: int = 5
+    top_k_coarse: int
 ) -> List[List[Tuple[Tuple[str,str,str], float]]]:
+    D, I = index.search(queries, top_k_coarse)
+    candidates = []
+    for scores, idxs in zip(D, I):
+        row = [(ids[i], float(scores[j])) for j,i in enumerate(idxs)]
+        candidates.append(row)
+    return candidates
+
+
+def rerank_candidates(
+    candidates: List[List[Tuple[Tuple[str,str,str], float]]],
+    chunks_path: Path,
+    rerank_model: str,
+    top_k: int,
+    query_texts: List[str]
+) -> List[List[Tuple[Tuple[str,str,str], float]]]:
+    # load chunk_texts from JSONL: [paper_id, section, chunk_id, text]
+    chunk_texts: Dict[Tuple[str,str,str], str] = {}
+    with open(chunks_path, encoding="utf-8") as f:
+        for line in f:
+            pid, sec, cid, txt = json.loads(line)
+            chunk_texts[(pid, sec, cid)] = txt
+    reranker = CrossEncoder(rerank_model)
+    final_ranks = []
+    for qtext, cand_list in zip(query_texts, candidates):
+        pairs = [(qtext, chunk_texts[cid]) for cid,_ in cand_list]
+        scores = reranker.predict(pairs)
+        ranked = sorted(
+            zip((cid for cid,_ in cand_list), scores),
+            key=lambda x: x[1], reverse=True
+        )[:top_k]
+        final_ranks.append(ranked)
+    return final_ranks
+
+
+def search(index: faiss.Index, ids: List[Tuple[str,str,str]], queries: np.ndarray, top_k: int = 5) -> List[List[Tuple[Tuple[str,str,str], float]]]:
     D, I = index.search(queries, top_k)
     results = []
     for scores, idxs in zip(D, I):
-        row = [(ids[i], float(scores[j])) for j,i in enumerate(idxs)]
-        results.append(row)
+        res = [(ids[i], float(scores[j])) for j,i in enumerate(idxs)]
+        results.append(res)
     return results
 
 
@@ -138,21 +163,23 @@ def hybrid_search(
     top_k_coarse: int = 100,
     top_k: int = 5
 ) -> List[List[Tuple[Tuple[str,str,str], float]]]:
-    # load chunk texts mapping
-    chunk_texts = {tuple(item[:3]): item[3] for item in map(json.loads, open(chunks_path))}
-    # cross-encoder
-    reranker = CrossEncoder(rerank_model, device=DEVICE)
+    # Load chunk texts: JSONL with [paper_id, section, chunk_id, text]
+    chunk_texts: Dict[Tuple[str,str,str], str] = {}
+    for line in open(chunks_path, encoding="utf-8"):
+        pid, sec, cid, txt = json.loads(line)
+        chunk_texts[(pid, sec, cid)] = txt
+    reranker = CrossEncoder(rerank_model)
     D_coarse, I_coarse = coarse_idx.search(queries, top_k_coarse)
-    final = []
-    for qi, (scores, idxs) in enumerate(zip(D_coarse, I_coarse)):
+    final_res = []
+    for scores, idxs in zip(D_coarse, I_coarse):
         cands = [ids[i] for i in idxs]
         texts = [chunk_texts[c] for c in cands]
-        pairs = [("", t) for t in texts]  # or supply actual query text
+        pairs = [("", t) for t in texts]
         rerank_scores = reranker.predict(pairs)
-        zipped = list(zip(cands, rerank_scores))
-        zipped.sort(key=lambda x: x[1], reverse=True)
-        final.append(zipped[:top_k])
-    return final
+        ranked = sorted(zip(cands, rerank_scores), key=lambda x: x[1], reverse=True)
+        final_res.append(ranked[:top_k])
+    return final_res
+
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
@@ -165,11 +192,31 @@ if __name__ == "__main__":
         choices=["FlatIP","FlatL2","HNSW","IVFPQ","OPQIVFPQ","HYBRID"],
         default="FlatIP"
     )
-    p.add_argument("--use-gpu", action="store_true")
     p.add_argument("--chunks", type=Path, help="Path to chunks JSONL for HYBRID")
     p.add_argument("--rerank-model", type=str, default="cross-encoder/stsb-roberta-large")
     p.add_argument("--topk-coarse", type=int, default=100)
     p.add_argument("--topk", type=int, default=5)
+
+    # OPQ+IVF-PQ
+    p.add_argument(
+        "--nlist",
+        type=int,
+        default=4096,
+        help="Number of IVF clusters for IVFPQ (nlist)"
+    )
+    p.add_argument(
+        "--m",
+        type=int,
+        default=64,
+        help="Number of PQ subquantizers (m)"
+    )
+    p.add_argument(
+        "--nbits",
+        type=int,
+        default=8,
+        help="Bits per PQ codebook entry (nbits)"
+    )
+
     args = p.parse_args()
 
     ids, vecs = load_embeddings(args.embeddings, args.ids)
@@ -177,30 +224,27 @@ if __name__ == "__main__":
     vecs = normalize_embeddings(vecs)
 
     if args.type == "HNSW":
-        index = build_hnsw_index(vecs, use_gpu=args.use_gpu)
+        index = build_hnsw_index(vecs)
     elif args.type == "IVFPQ":
-        index = build_ivfopq_index(vecs, use_gpu=args.use_gpu)
+        index = build_ivfopq_index(
+            vecs,
+            index_out=args.index_out,
+            nlist=args.nlist,  # если вы добавили эти флаги
+            m=args.m,
+            nbits=args.nbits
+        )
     elif args.type == "OPQIVFPQ":
         # alias to IVFPQ with OPQ applied
-        index = build_ivfopq_index(vecs, use_gpu=args.use_gpu)
+        index = build_ivfopq_index(
+            vecs,
+            index_out=args.index_out,
+            nlist=args.nlist,  # если вы добавили эти флаги
+            m=args.m,
+            nbits=args.nbits
+        )
     else:
         # FlatIP/FlatL2
         metric = "IP" if args.type == "FlatIP" else "L2"
-        index = build_flat_index(vecs, metric=metric, use_gpu=args.use_gpu)
+        index = build_flat_index(vecs, metric=metric)
 
     save_index(index, ids, args.index_out, args.ids_out)
-
-    # test search
-    q = vecs[:1]
-    if args.type == "HYBRID":
-        assert args.chunks, "--chunks required for HYBRID"
-        res = hybrid_search(
-            index, ids, q,
-            chunks_path=args.chunks,
-            rerank_model=args.rerank_model,
-            top_k_coarse=args.topk_coarse,
-            top_k=args.topk
-        )
-    else:
-        res = search(index, ids, q, top_k=args.topk)
-    print(res)
