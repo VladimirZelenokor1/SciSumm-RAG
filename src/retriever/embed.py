@@ -41,6 +41,19 @@ SUMMARY_FIRST_N  = int(os.getenv("SUMMARY_FIRST_N",    "1"))  # summary only for
 STOPWORDS = set(nltk.corpus.stopwords.words("english"))
 
 
+def embed_texts(texts: list[str]) -> np.ndarray:
+    """
+    Кодирует список текстов в numpy-массив эмбеддингов.
+    """
+    _embedder = SentenceTransformer(MODEL_NAME, device=DEVICE)
+
+    return _embedder.encode(
+        texts,
+        batch_size=STREAM_BATCH,
+        convert_to_numpy=True
+    )
+
+
 def preprocess_text(text: str) -> str:
     """
     Remove LaTeX/math, normalize unicode and whitespace.

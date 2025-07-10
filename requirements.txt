@@ -11,3 +11,4 @@ wordcloud
 seaborn
 tqdm
 faiss-cpu
+streamlit
