@@ -52,22 +52,40 @@ def preprocess_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def load_metadata(path: Path) -> pd.DataFrame:
+def load_metadata(
+    path: Path,
+    max_papers: int = 50000,
+    min_year: int = 2020,
+    min_length: int = 2000,
+    allowed_categories: list[str] = ["cs.AI", "cs.CL", "stat.ML"]
+) -> pd.DataFrame:
     df = pd.read_csv(path)
-    req = {"full_text","title","authors","year","categories","paper_id"}
-    missing = req - set(df.columns)
+    required = {"full_text", "title", "authors", "year", "categories", "paper_id"}
+    missing = required - set(df.columns)
     if missing:
-        logger.error("Missing columns: %s", missing)
-        sys.exit(1)
+        logger.error("Missing metadata columns: %s", missing)
+        raise ValueError(f"Missing columns: {missing}")
+
+    # 1) Discard short texts and old articles
     df = df.dropna(subset=["full_text"]).copy()
     df["text_len"] = df["full_text"].str.len()
-    df = df[df["text_len"] >= MIN_FULLTEXT_LEN]
-    df = df[df["year"] >= 2015]
-    if len(df) > MAX_PAPERS:
-        logger.info("Sampling %d -> %d papers", len(df), MAX_PAPERS)
-        df = df.sample(n=MAX_PAPERS, random_state=42)
+    df = df[df["text_len"] >= min_length]
+    df = df[df["year"] >= min_year]
+
+    # 2) Filter by category
+    # If the article belongs to at least one of the allowed_categories
+    df = df[df["categories"].apply(
+        lambda cats: any(cat in cats.split() for cat in allowed_categories)
+    )]
+
+    # 3) Sampling, if it's still too much
+    n = len(df)
+    if n > max_papers:
+        logger.info("Sampling down from %d to %d papers", n, max_papers)
+        df = df.sample(n=max_papers, random_state=42)
     else:
-        logger.info("Using all %d papers", len(df))
+        logger.info("Using all %d papers after filtering", n)
+
     return df.reset_index(drop=True)
 
 
@@ -189,34 +207,65 @@ def main():
     part = 0
     t_chunk = t_encode = 0.0
     start_iter = time.time()
-    with open(ids_file, "a", encoding="utf-8") as sink:
+
+    chunks_file = args.out_dir / "chunks.jsonl"
+
+    # Открываем оба файла сразу, в режиме «добавить»
+    with open(ids_file, "a", encoding="utf-8") as sink_ids, \
+            open(chunks_file, "a", encoding="utf-8") as sink_chunks:
+
         for idt, ctx in tqdm(iter_contextual_chunks(df, skip), desc="Chunk→Context"):
             buf_ids.append(idt)
             buf_texts.append(ctx)
+
             if len(buf_texts) >= STREAM_BATCH:
+                # кодируем батч
                 t0 = time.time()
                 vecs = model.encode(buf_texts, batch_size=STREAM_BATCH, convert_to_numpy=True)
                 t_encode += time.time() - t0
+
+                # сохраняем эмбеддинги
                 np.save(args.out_dir / f"embeddings_part{part}.npy", vecs)
-                for tid in buf_ids:
-                    sink.write(json.dumps(tid, ensure_ascii=False) + "\n")
+
+                # записываем ids и параллельно текст чанков
+                for tid, full_ctx in zip(buf_ids, buf_texts):
+                    sink_ids.write(json.dumps(tid, ensure_ascii=False) + "\n")
+                    # из full_ctx берём часть после пустой строки — собственно текст чанка
+                    raw_chunk = full_ctx.split("\n\n")[-1]
+                    pid, section, cid = tid
+                    sink_chunks.write(
+                        json.dumps([pid, section, cid, raw_chunk], ensure_ascii=False) + "\n"
+                    )
+
                 t_chunk += STREAM_BATCH
                 part += 1
                 buf_ids, buf_texts = [], []
                 logger.info("Processed %d chunks, encode time %.1f s", t_chunk, t_encode)
+
         # flush remainder
         if buf_texts:
             t0 = time.time()
             vecs = model.encode(buf_texts, batch_size=STREAM_BATCH, convert_to_numpy=True)
             t_encode += time.time() - t0
             np.save(args.out_dir / f"embeddings_part{part}.npy", vecs)
-            for tid in buf_ids:
-                sink.write(json.dumps(tid, ensure_ascii=False) + "\n")
-            t_chunk += len(buf_texts)
-    total_time = time.time() - start_iter
-    logger.info("Total chunks: %d, total encode time: %.1f s, total time: %.1f s",
-                t_chunk, t_encode, total_time)
 
+            for tid, full_ctx in zip(buf_ids, buf_texts):
+                sink_ids.write(json.dumps(tid, ensure_ascii=False) + "\n")
+                raw_chunk = full_ctx.split("\n\n")[-1]
+                pid, section, cid = tid
+                sink_chunks.write(
+                    json.dumps([pid, section, cid, raw_chunk], ensure_ascii=False) + "\n"
+                )
+
+            t_chunk += len(buf_texts)
+
+    total_time = time.time() - start_iter
+    logger.info(
+        "Total chunks: %d, total encode time: %.1f s, total time: %.1f s",
+        t_chunk,
+        t_encode,
+        total_time
+    )
 
 
 

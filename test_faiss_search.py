@@ -107,14 +107,8 @@ def main():
     print(f"Loading index from {args.index}...")
     index = load_index(args.index)
 
-    print(f"Loading OPQ matrix from...")
-    opq_mat = faiss.read_VectorTransform("data/index/faiss_ivfopq.opq")
-
-    vecs_opq = opq_mat.apply_py(vecs)
-
     print(f"Evaluating recall@{args.topk} on sample of {args.sample_size}... ")
-    ex, pap = evaluate_recall(ids, vecs_opq, index, args.sample_size, args.topk)
-    print(f"Exact chunk recall@{args.topk}: {ex:.3f}")
+    ex, pap = evaluate_recall(ids, vecs, index, args.sample_size, args.topk)
     print(f"Same-paper recall@{args.topk}: {pap:.3f}")
 
     if args.mode == "hybrid":
@@ -122,13 +116,13 @@ def main():
             parser.error("--chunks is required for hybrid mode")
         print("Running hybrid search on first query...")
         hybrid = hybrid_search(
-            index, ids, vecs_opq[:1], args.chunks, args.rerank_model,
+            index, ids, vecs[:1], args.chunks, args.rerank_model,
             args.topk_coarse, args.topk
         )
         print(hybrid)
     else:
         print("Running simple search on first query...")
-        D, I = index.search(vecs_opq[:1], args.topk)
+        D, I = index.search(vecs[:1], args.topk)
         results = []
         for score, idx in zip(D[0], I[0]):
             results.append((ids[idx], float(score)))

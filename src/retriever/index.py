@@ -62,25 +62,18 @@ def build_ivfopq_index(
     nbits: int = 8
 ) -> faiss.Index:
     """
-    Построить OPQ + IVF-PQ индекс и сохранить OPQ-матрицу рядом с индексом.
-
-    :param vectors: корпус эмбеддингов, shape (N, D)
-    :param index_out: полный путь до .index файла (например data/index/faiss_ivfopq.index)
-    :param nlist: число кластеров для IVF
-    :param m: число суб-векторов для PQ и OPQ
-    :param nbits: число бит на суб-вектор в PQ
-    :returns: построенный faiss.IndexIVFPQ
+    Construct an OPQ + IVF-PQ index and store the OPQ matrix next to the index.
     """
-    # 1) Обучаем OPQ и трансформируем корпус
+    # 1) Train the OPQ and transform the corpus
     v_opq, opq_mat = apply_opq(vectors, M=m)
 
-    # 2) Подготавливаем директорию и сохраняем OPQ-матрицу
+    # 2) Prepare a directory and save the OPQ matrix
     index_out = Path(index_out)
     index_out.parent.mkdir(parents=True, exist_ok=True)
     opq_path = index_out.with_suffix(".opq")  # e.g. data/index/faiss_ivfopq.opq
     faiss.write_VectorTransform(opq_mat, str(opq_path))
 
-    # 3) Строим IVF-PQ на OPQ-векторах
+    # 3) Build IVF-PQ on OPQ vectors
     D = v_opq.shape[1]
     quantizer = faiss.IndexFlatIP(D)
     ivfpq_idx = faiss.IndexIVFPQ(quantizer, D, nlist, m, nbits)
@@ -229,7 +222,7 @@ if __name__ == "__main__":
         index = build_ivfopq_index(
             vecs,
             index_out=args.index_out,
-            nlist=args.nlist,  # если вы добавили эти флаги
+            nlist=args.nlist,
             m=args.m,
             nbits=args.nbits
         )
