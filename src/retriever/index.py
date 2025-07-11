@@ -1,19 +1,30 @@
+import os
+
 import numpy as np
+import logging
 import json
 import faiss
 import pickle
 from pathlib import Path
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional, Union
 import argparse
 from sentence_transformers import CrossEncoder
 
+# Initialize logging
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
 # CPU-only FAISS indexer for RAG pipeline
+IndexID = Tuple[str, str, str]  # paper_id, section, chunk_id
 
 
 def load_embeddings(path_vec: Path, path_ids: Path) -> Tuple[List[Tuple[str,str,str]], np.ndarray]:
     vectors = np.load(path_vec)  # shape (N, D)
     with open(path_ids, "r", encoding="utf-8") as f:
-        ids = json.load(f)
+        raw_ids = json.load(f)
+    ids = [tuple(x) for x in raw_ids]
     if len(ids) != vectors.shape[0]:
         raise ValueError("Mismatch between IDs and embedding vectors: {} vs {}".format(
             len(ids), vectors.shape[0]
@@ -26,25 +37,31 @@ def normalize_embeddings(vectors: np.ndarray) -> np.ndarray:
     return vectors / np.clip(norm, 1e-12, None)
 
 
-def build_flat_index(vectors: np.ndarray, metric: str = "IP") -> faiss.Index:
-    D = vectors.shape[1]
-    if metric == "IP":
-        index = faiss.IndexFlatIP(D)
-    elif metric == "L2":
-        index = faiss.IndexFlatL2(D)
+def build_flat_index(dim: int, metric: str = "IP") -> faiss.Index:
+    """
+    Flat (brute-force) index.
+    metric: “IP” or “L2”
+    """
+    if metric.upper() == "IP":
+        return faiss.IndexFlatIP(dim)
     else:
-        raise ValueError(f"Unsupported metric: {metric}")
-    index.add(vectors)
-    return index
+        return faiss.IndexFlatL2(dim)
 
 
-def build_hnsw_index(vectors: np.ndarray, M: int = 64, efC: int = 200, efS: int = 200) -> faiss.Index:
-    D = vectors.shape[1]
-    index = faiss.IndexHNSWFlat(D, M)
-    index.hnsw.efConstruction = efC
-    index.add(vectors)
-    index.hnsw.efSearch = efS
-    return index
+def build_hnsw_index(dim: int,
+                     M: int = 64,
+                     ef_construction: int = 200,
+                     ef_search: int = 200,
+                     metric: str = "IP") -> faiss.Index:
+    """
+    HNSW index. The parameters M, efConstruction, efSearch can be fine-tuned.
+    Remember: memory ~ O(N * M).
+    """
+    space = faiss.METRIC_INNER_PRODUCT if metric.upper() == "IP" else faiss.METRIC_L2
+    idx = faiss.IndexHNSWFlat(dim, M, space)
+    idx.hnsw.efConstruction = ef_construction
+    idx.hnsw.efSearch = ef_search
+    return idx
 
 
 def apply_opq(vectors: np.ndarray, M: int = 64) -> Tuple[np.ndarray, faiss.OPQMatrix]:
@@ -54,48 +71,87 @@ def apply_opq(vectors: np.ndarray, M: int = 64) -> Tuple[np.ndarray, faiss.OPQMa
     return opq.apply_py(vectors), opq
 
 
-def build_ivfopq_index(
-    vectors: np.ndarray,
-    index_out: Path,
-    nlist: int = 4096,
-    m: int = 64,
-    nbits: int = 8
-) -> faiss.Index:
+def build_ivfopq_index(dim: int,
+                       nlist: int = 1024,
+                       m_pq: int = 64,
+                       nbits: int = 8,
+                       use_opq: bool = True,
+                       metric: str = "IP"
+                       ) -> Tuple[faiss.Index, Optional[faiss.OPQMatrix]]:
     """
-    Construct an OPQ + IVF-PQ index and store the OPQ matrix next to the index.
+    IVF-PQ (+ OPQ) index.
+ nlist: number of clusters, m_pq: number of sub-vectors, nbits: bits per sub-vector.
+    If use_opq=True, return the OPQ matrix for training/saving.
     """
-    # 1) Train the OPQ and transform the corpus
-    v_opq, opq_mat = apply_opq(vectors, M=m)
+    space = faiss.METRIC_INNER_PRODUCT if metric.upper() == "IP" else faiss.METRIC_L2
+    quantizer = faiss.IndexFlatIP(dim) if metric.upper() == "IP" else faiss.IndexFlatL2(dim)
 
-    # 2) Prepare a directory and save the OPQ matrix
-    index_out = Path(index_out)
-    index_out.parent.mkdir(parents=True, exist_ok=True)
-    opq_path = index_out.with_suffix(".opq")  # e.g. data/index/faiss_ivfopq.opq
-    faiss.write_VectorTransform(opq_mat, str(opq_path))
+    opq_matrix: Optional[faiss.OPQMatrix] = None
 
-    # 3) Build IVF-PQ on OPQ vectors
-    D = v_opq.shape[1]
-    quantizer = faiss.IndexFlatIP(D)
-    ivfpq_idx = faiss.IndexIVFPQ(quantizer, D, nlist, m, nbits)
-    ivfpq_idx.train(v_opq)
-    ivfpq_idx.add(v_opq)
+    if use_opq:
+        # OPQ is trained on the original data
+        opq_matrix = faiss.OPQMatrix(dim, m_pq)
+        # create the IVF-PQ itself wrapped in an OPQ transform
+        ivfpq = faiss.IndexPreTransform(
+            opq_matrix,
+            faiss.IndexIVFPQ(quantizer, dim, nlist, m_pq, nbits, space)
+        )
+    else:
+        ivfpq = faiss.IndexIVFPQ(quantizer, dim, nlist, m_pq, nbits, space)
 
-    return ivfpq_idx
-
-
-def save_index(index: faiss.Index, ids: List[Tuple[str, str, str]], index_path: Path, ids_path: Path):
-    # FAISS CPU-only, direct save
-    index_path.parent.mkdir(parents=True, exist_ok=True)
-    faiss.write_index(index, str(index_path))
-    with open(ids_path, "w", encoding="utf-8") as f:
-        json.dump(ids, f, ensure_ascii=False)
+    return ivfpq, opq_matrix
 
 
-def load_index(index_path: Path, ids_path: Path) -> Tuple[faiss.Index, List[Tuple[str, str, str]]]:
-    index = faiss.read_index(str(index_path))
-    with open(ids_path, "r", encoding="utf-8") as f:
+def save_index(index: faiss.Index,
+               ids: List[IndexID],
+               path_prefix: str,
+               opq_matrix: Optional[faiss.OPQMatrix] = None
+               ) -> None:
+    """
+    Save the index and metadata.
+    If there is an OPQ matrix, save it separately.
+    """
+    out_dir = os.path.dirname(path_prefix)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    # The FAISS file itself
+    faiss.write_index(index, f"{path_prefix}.index")
+    # Metadata
+    with open(f"{path_prefix}_ids.json", "w", encoding="utf-8") as f:
+        json.dump(ids, f, ensure_ascii=False, indent=2)
+
+    # OPQ matrix is also separate
+    if opq_matrix is not None:
+        faiss.write_VectorTransform(opq_matrix, f"{path_prefix}.opq")
+
+
+def load_index(path_prefix: str,
+               dim: int,
+               metric: str = "IP",
+               use_opq: bool = False
+               ) -> Tuple[faiss.Index, List[IndexID]]:
+    """
+    Load the index, OPQ matrix and metadata.
+    If use_opq=True, wait for the .opq file and wrap the index in OPQ.
+    """
+    # Metadata
+    with open(f"{path_prefix}_ids.json", "r", encoding="utf-8") as f:
         ids = json.load(f)
-    return index, ids
+
+    # Main index
+    idx = faiss.read_index(f"{path_prefix}.index")
+
+    if use_opq:
+        # wrap the loaded IVF-PQ in OPQ preprocessing
+        opq = faiss.read_VectorTransform(f"{path_prefix}.opq")
+        idx = faiss.IndexPreTransform(opq, idx)
+
+    # For HNSW you can reconfigure efSearch after loading
+    if hasattr(idx, "hnsw") and hasattr(idx.hnsw, "efSearch"):
+        idx.hnsw.efSearch = getattr(idx.hnsw, "efSearch", 200)
+
+    return idx, ids
 
 
 def retrieve_candidates(
@@ -112,132 +168,167 @@ def retrieve_candidates(
     return candidates
 
 
-def rerank_candidates(
-    candidates: List[List[Tuple[Tuple[str,str,str], float]]],
-    chunks_path: Path,
-    rerank_model: str,
-    top_k: int,
-    query_texts: List[str]
-) -> List[List[Tuple[Tuple[str,str,str], float]]]:
-    # load chunk_texts from JSONL: [paper_id, section, chunk_id, text]
-    chunk_texts: Dict[Tuple[str,str,str], str] = {}
-    with open(chunks_path, encoding="utf-8") as f:
-        for line in f:
-            pid, sec, cid, txt = json.loads(line)
-            chunk_texts[(pid, sec, cid)] = txt
-    reranker = CrossEncoder(rerank_model)
-    final_ranks = []
-    for qtext, cand_list in zip(query_texts, candidates):
-        pairs = [(qtext, chunk_texts[cid]) for cid,_ in cand_list]
-        scores = reranker.predict(pairs)
-        ranked = sorted(
-            zip((cid for cid,_ in cand_list), scores),
-            key=lambda x: x[1], reverse=True
-        )[:top_k]
-        final_ranks.append(ranked)
-    return final_ranks
+def search(
+    index: faiss.Index,
+    ids: List[IndexID],
+    queries: np.ndarray,
+    top_k: int = 5
+) -> List[List[Tuple[IndexID, float]]]:
+    """
+    Exact k-NN: returns for each query top-k (id, score).
+    """
+    # FAISS expects float32
+    q = queries.astype(np.float32)
+    distances, indices = index.search(q, top_k)
 
-
-def search(index: faiss.Index, ids: List[Tuple[str,str,str]], queries: np.ndarray, top_k: int = 5) -> List[List[Tuple[Tuple[str,str,str], float]]]:
-    D, I = index.search(queries, top_k)
-    results = []
-    for scores, idxs in zip(D, I):
-        res = [(ids[i], float(scores[j])) for j,i in enumerate(idxs)]
-        results.append(res)
+    results: List[List[Tuple[IndexID, float]]] = []
+    for dist_row, idx_row in zip(distances, indices):
+        row: List[Tuple[IndexID, float]] = []
+        for rank, idx in enumerate(idx_row):
+            if idx < 0:
+                continue
+            row.append((ids[idx], float(dist_row[rank])))
+        results.append(row)
     return results
 
 
 def hybrid_search(
     coarse_idx: faiss.Index,
-    ids: List[Tuple[str,str,str]],
+    ids: List[IndexID],
     queries: np.ndarray,
+    query_texts: List[str],
     chunks_path: Path,
-    rerank_model: str,
+    rerank_model: Union[str, CrossEncoder],
     top_k_coarse: int = 100,
     top_k: int = 5
-) -> List[List[Tuple[Tuple[str,str,str], float]]]:
-    # Load chunk texts: JSONL with [paper_id, section, chunk_id, text]
-    chunk_texts: Dict[Tuple[str,str,str], str] = {}
-    for line in open(chunks_path, encoding="utf-8"):
-        pid, sec, cid, txt = json.loads(line)
-        chunk_texts[(pid, sec, cid)] = txt
-    reranker = CrossEncoder(rerank_model)
-    D_coarse, I_coarse = coarse_idx.search(queries, top_k_coarse)
-    final_res = []
-    for scores, idxs in zip(D_coarse, I_coarse):
-        cands = [ids[i] for i in idxs]
+) -> List[List[Tuple[IndexID, float]]]:
+    """
+    Mixed search: first FAISS, then re-ranking by CrossEncoder.
+    """
+    # load chunk texts
+    chunk_texts: Dict[IndexID, str] = {}
+    with chunks_path.open(encoding="utf-8") as f:
+        for line in f:
+            pid, sec, cid, txt = json.loads(line)
+            chunk_texts[(pid, sec, cid)] = txt
+
+    if isinstance(rerank_model, str):
+        reranker = CrossEncoder(rerank_model)
+    else:
+        reranker = rerank_model
+
+    # coarse FAISS
+    Dc, Ic = coarse_idx.search(queries.astype(np.float32), top_k_coarse)
+
+    results: List[List[Tuple[IndexID, float]]] = []
+    for i, (dist_row, idx_row) in enumerate(zip(Dc, Ic)):
+        qtext = query_texts[i]
+
+        # collect candidates and their texts
+        cands = [tuple(ids[j]) for j in idx_row if j >= 0]
         texts = [chunk_texts[c] for c in cands]
-        pairs = [("", t) for t in texts]
+
+        # form pairs (query, chunk) and make predictions
+        pairs = [(qtext, chunk) for chunk in texts]
         rerank_scores = reranker.predict(pairs)
-        ranked = sorted(zip(cands, rerank_scores), key=lambda x: x[1], reverse=True)
-        final_res.append(ranked[:top_k])
-    return final_res
+
+        # sort by score desc and give top_k
+        ranked = sorted(zip(cands, rerank_scores),
+                        key=lambda x: x[1], reverse=True)[:top_k]
+        results.append(ranked)
+
+    return results
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--embeddings", type=Path, required=True)
     p.add_argument("--ids", type=Path, required=True)
-    p.add_argument("--index-out", type=Path, default=Path("data/index/faiss.index"))
-    p.add_argument("--ids-out", type=Path, default=Path("data/index/ids.json"))
+    p.add_argument("--index-prefix", type=Path, default=Path("data/index/faiss"))
     p.add_argument(
         "--type",
-        choices=["FlatIP","FlatL2","HNSW","IVFPQ","OPQIVFPQ","HYBRID"],
+        choices=["FlatIP", "FlatL2", "HNSW", "IVFPQ", "OPQIVFPQ"],
         default="FlatIP"
     )
-    p.add_argument("--chunks", type=Path, help="Path to chunks JSONL for HYBRID")
+    p.add_argument("--chunks", type=Path, help="для HYBRID reranking")
     p.add_argument("--rerank-model", type=str, default="cross-encoder/stsb-roberta-large")
     p.add_argument("--topk-coarse", type=int, default=100)
     p.add_argument("--topk", type=int, default=5)
-
-    # OPQ+IVF-PQ
-    p.add_argument(
-        "--nlist",
-        type=int,
-        default=4096,
-        help="Number of IVF clusters for IVFPQ (nlist)"
-    )
-    p.add_argument(
-        "--m",
-        type=int,
-        default=64,
-        help="Number of PQ subquantizers (m)"
-    )
-    p.add_argument(
-        "--nbits",
-        type=int,
-        default=8,
-        help="Bits per PQ codebook entry (nbits)"
-    )
+    p.add_argument("--nlist", type=int, default=256, help="IVFPQ: число кластеров")
+    p.add_argument("--m", type=int, default=16, help="IVFPQ: число под-векторов")
+    p.add_argument("--nbits", type=int, default=4, help="IVFPQ: бит на под-вектор")
+    p.add_argument("--M", type=int, default=64, help="HNSW: M")
+    p.add_argument("--efC", type=int, default=200, help="HNSW: efConstruction")
+    p.add_argument("--efS", type=int, default=200, help="HNSW: efSearch")
 
     args = p.parse_args()
 
-    ids, vecs = load_embeddings(args.embeddings, args.ids)
-    # cosine normalization for IP indices
+    # load embeddings + ids
+    ids_list, vecs = load_embeddings(args.embeddings, args.ids)
+    # if IP metric - normalize
     vecs = normalize_embeddings(vecs)
 
-    if args.type == "HNSW":
-        index = build_hnsw_index(vecs)
-    elif args.type == "IVFPQ":
-        index = build_ivfopq_index(
-            vecs,
-            index_out=args.index_out,
-            nlist=args.nlist,
-            m=args.m,
-            nbits=args.nbits
-        )
-    elif args.type == "OPQIVFPQ":
-        # alias to IVFPQ with OPQ applied
-        index = build_ivfopq_index(
-            vecs,
-            index_out=args.index_out,
-            nlist=args.nlist,  # если вы добавили эти флаги
-            m=args.m,
-            nbits=args.nbits
-        )
-    else:
-        # FlatIP/FlatL2
-        metric = "IP" if args.type == "FlatIP" else "L2"
-        index = build_flat_index(vecs, metric=metric)
+    dim = vecs.shape[1]
+    metric = "IP" if args.type.endswith("IP") or args.type.endswith("PQ") else "L2"
+    index = None
+    opq_matrix = None
 
-    save_index(index, ids, args.index_out, args.ids_out)
+    if args.type in ("FlatIP", "FlatL2"):
+        index = build_flat_index(dim, metric=metric)
+    elif args.type == "HNSW":
+        index = build_hnsw_index(
+            dim,
+            M=args.M,
+            ef_construction=args.efC,
+            ef_search=args.efS,
+            metric=metric
+        )
+    elif args.type == "IVFPQ":
+        n_vectors = vecs.shape[0]
+        requested_nlist = args.nlist
+        actual_nlist = min(requested_nlist, n_vectors)
+        if actual_nlist < requested_nlist:
+            logger.warning(
+                "Requested nlist=%d but only %d vectors available; reducing to %d",
+                requested_nlist, n_vectors, actual_nlist
+            )
+        ivf, _ = build_ivfopq_index(
+            dim,
+            nlist=actual_nlist,
+            m_pq=args.m,
+            nbits=args.nbits,
+            use_opq=False,
+            metric=metric
+        )
+        ivf.train(vecs.astype(np.float32))
+        index = ivf
+    elif args.type == "OPQIVFPQ":
+        n_vectors = vecs.shape[0]
+        requested_nlist = args.nlist
+        actual_nlist = min(requested_nlist, n_vectors)
+        if actual_nlist < requested_nlist:
+            logger.warning(
+                "Requested nlist=%d but only %d vectors available; reducing to %d",
+                requested_nlist, n_vectors, actual_nlist
+            )
+        ivf, opq_matrix = build_ivfopq_index(
+            dim,
+            nlist=actual_nlist,
+            m_pq=args.m,
+            nbits=args.nbits,
+            use_opq=True,
+            metric=metric
+        )
+
+        opq_matrix.train(vecs.astype(np.float32))
+
+        vecs_opq = opq_matrix.apply(vecs.astype(np.float32))
+        ivf.train(vecs_opq)
+
+        index = faiss.IndexPreTransform(opq_matrix, ivf)
+
+    # Add all the vectors
+    index.add(vecs.astype(np.float32))
+
+    # Save the index and metadata (including .opq, if any)
+    save_index(index, ids_list, str(args.index_prefix), opq_matrix)

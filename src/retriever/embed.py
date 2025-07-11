@@ -6,8 +6,9 @@ import argparse
 
 import numpy as np
 import pandas as pd
-import tiktoken
+import multiprocessing
 from sentence_transformers import SentenceTransformer
+from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 import torch
 import nltk
 from collections import Counter
@@ -25,12 +26,16 @@ def _init_nltk():
     nltk.download("stopwords", quiet=True)
 _init_nltk()
 
+# global worshippers
+_worker_model: SentenceTransformer = None
+_skip_pids: set = None
+MODEL: SentenceTransformer = None
+
 # Configuration defaults and environment overrides
 SECTION_RE       = re.compile(r"\n(\d+\.\s+[^\n]+)\n")
-MODEL_NAME       = os.getenv("EMBED_MODEL", "paraphrase-MiniLM-L3-v2")  # lighter model
+MODEL_NAME       = os.getenv("EMBED_MODEL", "all-MiniLM-L6-v2")  # lighter model
 DEVICE           = "cuda" if torch.cuda.is_available() else "cpu"
-TOKENIZER        = tiktoken.get_encoding("gpt2")
-MAX_TOKENS       = int(os.getenv("MAX_TOKENS",        "400"))
+MAX_TOKENS       = int(os.getenv("MAX_TOKENS",        "512"))
 OVERLAP_TOKENS   = int(os.getenv("OVERLAP_TOKENS",    "50"))
 STREAM_BATCH     = int(os.getenv("STREAM_BATCH",     "5000"))  # increased batch size
 MAX_PAPERS       = int(os.getenv("MAX_PAPERS",    "100000"))
@@ -41,9 +46,46 @@ SUMMARY_FIRST_N  = int(os.getenv("SUMMARY_FIRST_N",    "1"))  # summary only for
 STOPWORDS = set(nltk.corpus.stopwords.words("english"))
 
 
+def _init_worker(model_name, device, skip_pids):
+    """Initializes the model and skip_pids in each process."""
+    global _worker_model, _skip_pids
+    _worker_model = SentenceTransformer(model_name, device=device)
+    _skip_pids = skip_pids
+
+
+def _process_row(row) -> List[Tuple[Tuple[str,str,str], str]]:
+    """
+    Handles a single df string: preprocessing → sections → chunks → build_contextual_chunk.
+    Returns a list (identifier, context) for this article.
+    """
+    results: List[Tuple[Tuple[str,str,str], str]] = []
+    pid = row["paper_id"]
+    if pid in _skip_pids:
+        return results
+
+    text = preprocess_text(row["full_text"])
+    summary_done = 0
+
+    for heading, body in split_into_sections(text):
+        for cid, chunk in chunk_section_by_tokens(heading, body):
+            summary_flag = (summary_done < SUMMARY_FIRST_N)
+            ctx = build_contextual_chunk(
+                pd.Series(row),
+                heading,
+                str(cid),
+                chunk,
+                summary_flag
+            )
+            results.append(((pid, heading, str(cid)), ctx))
+            if summary_flag:
+                summary_done += 1
+
+    return results
+
+
 def embed_texts(texts: list[str]) -> np.ndarray:
     """
-    Кодирует список текстов в numpy-массив эмбеддингов.
+    Encodes a list of texts into a numpy array of embeddings.
     """
     _embedder = SentenceTransformer(MODEL_NAME, device=DEVICE)
 
@@ -70,28 +112,45 @@ def load_metadata(
     max_papers: int = 50000,
     min_year: int = 2020,
     min_length: int = 2000,
-    allowed_categories: list[str] = ["cs.AI", "cs.CL", "stat.ML"]
+    allowed_categories: list[str] = None
 ) -> pd.DataFrame:
-    df = pd.read_csv(path)
+    """
+    Loads and filters article metadata.
+    Default:
+      - articles from 2020 and newer,
+      - texts ≥2000 characters,
+    """
+    df = pd.read_csv(path, low_memory=False)
     required = {"full_text", "title", "authors", "year", "categories", "paper_id"}
     missing = required - set(df.columns)
     if missing:
         logger.error("Missing metadata columns: %s", missing)
         raise ValueError(f"Missing columns: {missing}")
 
-    # 1) Discard short texts and old articles
+    # 1) Leave only with full_text
     df = df.dropna(subset=["full_text"]).copy()
     df["text_len"] = df["full_text"].str.len()
+
+    # 2) Filter by length and year
     df = df[df["text_len"] >= min_length]
     df = df[df["year"] >= min_year]
 
-    # 2) Filter by category
-    # If the article belongs to at least one of the allowed_categories
-    df = df[df["categories"].apply(
-        lambda cats: any(cat in cats.split() for cat in allowed_categories)
-    )]
+    # 3) If allowed_categories are set - filter, otherwise skip everything
+    if allowed_categories:
+        df = df[df["categories"].apply(
+            lambda cats: any(cat in cats.split() for cat in allowed_categories)
+        )]
 
-    # 3) Sampling, if it's still too much
+    # 4) only 'en'
+    def is_english(text: str) -> bool:
+        words = re.findall(r"\b\w+\b", text.lower())
+        if not words: return False
+        eng_cnt = sum(1 for w in words if w in ENGLISH_STOP_WORDS)
+        return eng_cnt / len(words) > 0.05
+
+    df = df[df["full_text"].apply(is_english)]
+
+    # 5) If max_papers is exceeded, a random sample will be taken
     n = len(df)
     if n > max_papers:
         logger.info("Sampling down from %d to %d papers", n, max_papers)
@@ -103,12 +162,30 @@ def load_metadata(
 
 
 def split_into_sections(text: str) -> List[Tuple[str, str]]:
+    """
+    If there are obvious headings in the text, split by them.
+    Otherwise - by paragraphs (double line feed).
+    """
     parts = SECTION_RE.split(text)
-    if len(parts) <= 1:
-        return [("Unknown", text)]
-    sections = []
-    for i in range(1, len(parts), 2):
-        sections.append((parts[i].strip(), parts[i+1].strip()))
+    sections: List[Tuple[str, str]] = []
+
+    if len(parts) > 1:
+        # parts[0] - text before the first header
+        intro = parts[0].strip()
+        if intro:
+            sections.append(("Introduction", intro))
+        # next: [header1, content1, header2, content2, ...].
+        for i in range(1, len(parts), 2):
+            heading = parts[i].strip() or "Unknown"
+            content = parts[i+1].strip()
+            if content:
+                sections.append((heading, content))
+    else:
+        # no headings - break it down into paragraphs
+        paras = [p.strip() for p in text.split("\n\n") if p.strip()]
+        for idx, p in enumerate(paras):
+            sections.append((f"para_{idx}", p))
+
     return sections
 
 
@@ -116,16 +193,22 @@ def chunk_section_by_tokens(
     heading: str, text: str
 ) -> Iterator[Tuple[str, str]]:
     """
-    Chunk the tokenized section of the GPT-2 tokenizer.
+    Chunk the tokenized section.
     """
-    tokens = TOKENIZER.encode(text)
-    start, cid = 0, 0
-    while start < len(tokens):
-        end = min(len(tokens), start + MAX_TOKENS)
-        chunk = TOKENIZER.decode(tokens[start:end])
+    model = _worker_model or MODEL
+    tokenizer = model.tokenizer
+    model_max = getattr(tokenizer, "model_max_length", MAX_TOKENS)
+
+    tokens = tokenizer.encode(text, add_special_tokens=False)
+    effective_max = model_max - 2
+    step = effective_max - OVERLAP_TOKENS
+
+    for cid, start in enumerate(range(0, len(tokens), step)):
+        end = min(len(tokens), start + effective_max)
+        chunk = tokenizer.decode(tokens[start:end], skip_special_tokens=True).strip()
         yield f"{heading}__{cid}", chunk
-        cid += 1
-        start = end - OVERLAP_TOKENS
+        if end == len(tokens):
+            break
 
 
 def extract_keywords(text: str, top_k: int = 5) -> List[str]:
@@ -202,6 +285,7 @@ def load_existing_pids(path: Path) -> set:
 
 
 def main():
+    global MODEL
     parser = argparse.ArgumentParser()
     parser.add_argument("--metadata-path", type=Path, required=True)
     parser.add_argument("--out-dir",       type=Path, default=Path("data/clean/"))
@@ -213,7 +297,9 @@ def main():
     ids_file = args.out_dir / "ids.jsonl"
     skip = load_existing_pids(ids_file) if args.resume else set()
 
-    model = SentenceTransformer(MODEL_NAME, device=DEVICE)
+    rows = df.to_dict(orient="records")
+
+    MODEL = SentenceTransformer(MODEL_NAME, device=DEVICE)
     logger.info("Using device: %s", DEVICE)
 
     buf_ids, buf_texts = [], []
@@ -223,45 +309,51 @@ def main():
 
     chunks_file = args.out_dir / "chunks.jsonl"
 
-    # Открываем оба файла сразу, в режиме «добавить»
     with open(ids_file, "a", encoding="utf-8") as sink_ids, \
-            open(chunks_file, "a", encoding="utf-8") as sink_chunks:
+         open(chunks_file, "a", encoding="utf-8") as sink_chunks:
 
-        for idt, ctx in tqdm(iter_contextual_chunks(df, skip), desc="Chunk→Context"):
-            buf_ids.append(idt)
-            buf_texts.append(ctx)
+        with multiprocessing.Pool(
+            processes=os.cpu_count(),
+            initializer=_init_worker,
+            initargs=(MODEL_NAME, DEVICE, skip)
+        ) as pool:
+            for batch in tqdm(pool.imap(_process_row, rows), total=len(rows), desc="Chunk→Context"):
+                for idt, ctx in batch:
+                    buf_ids.append(idt)
+                    buf_texts.append(ctx)
 
-            if len(buf_texts) >= STREAM_BATCH:
-                # кодируем батч
-                t0 = time.time()
-                vecs = model.encode(buf_texts, batch_size=STREAM_BATCH, convert_to_numpy=True)
-                t_encode += time.time() - t0
+                # as soon as STREAM_BATCH contexts are accumulated - encode and reset
+                while len(buf_texts) >= STREAM_BATCH:
+                    t0 = time.time()
+                    vecs = MODEL.encode(buf_texts[:STREAM_BATCH],
+                                        batch_size=STREAM_BATCH,
+                                        convert_to_numpy=True)
+                    t_encode += time.time() - t0
 
-                # сохраняем эмбеддинги
-                np.save(args.out_dir / f"embeddings_part{part}.npy", vecs)
+                    np.save(args.out_dir / f"embeddings_part{part}.npy", vecs)
+                    for tid, full_ctx in zip(buf_ids[:STREAM_BATCH], buf_texts[:STREAM_BATCH]):
+                        sink_ids.write(json.dumps(tid, ensure_ascii=False) + "\n")
+                        raw_chunk = full_ctx.split("\n\n")[-1]
+                        pid, section, cid = tid
+                        sink_chunks.write(
+                            json.dumps([pid, section, cid, raw_chunk], ensure_ascii=False) + "\n"
+                        )
 
-                # записываем ids и параллельно текст чанков
-                for tid, full_ctx in zip(buf_ids, buf_texts):
-                    sink_ids.write(json.dumps(tid, ensure_ascii=False) + "\n")
-                    # из full_ctx берём часть после пустой строки — собственно текст чанка
-                    raw_chunk = full_ctx.split("\n\n")[-1]
-                    pid, section, cid = tid
-                    sink_chunks.write(
-                        json.dumps([pid, section, cid, raw_chunk], ensure_ascii=False) + "\n"
-                    )
-
-                t_chunk += STREAM_BATCH
-                part += 1
-                buf_ids, buf_texts = [], []
-                logger.info("Processed %d chunks, encode time %.1f s", t_chunk, t_encode)
+                    t_chunk += STREAM_BATCH
+                    part += 1
+                    # delete already saved ones from the buffer
+                    buf_ids = buf_ids[STREAM_BATCH:]
+                    buf_texts = buf_texts[STREAM_BATCH:]
+                    logger.info("Processed %d chunks, encode time %.1f s", t_chunk, t_encode)
 
         # flush remainder
         if buf_texts:
             t0 = time.time()
-            vecs = model.encode(buf_texts, batch_size=STREAM_BATCH, convert_to_numpy=True)
+            vecs = MODEL.encode(buf_texts,
+                                batch_size=STREAM_BATCH,
+                                convert_to_numpy=True)
             t_encode += time.time() - t0
             np.save(args.out_dir / f"embeddings_part{part}.npy", vecs)
-
             for tid, full_ctx in zip(buf_ids, buf_texts):
                 sink_ids.write(json.dumps(tid, ensure_ascii=False) + "\n")
                 raw_chunk = full_ctx.split("\n\n")[-1]
@@ -269,7 +361,6 @@ def main():
                 sink_chunks.write(
                     json.dumps([pid, section, cid, raw_chunk], ensure_ascii=False) + "\n"
                 )
-
             t_chunk += len(buf_texts)
 
     total_time = time.time() - start_iter
@@ -279,7 +370,6 @@ def main():
         t_encode,
         total_time
     )
-
 
 
 if __name__ == "__main__":

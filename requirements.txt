@@ -4,7 +4,6 @@ pandas
 pytest
 nltk
 sentence-transformers
-tiktoken
 rake_nltk
 matplotlib
 wordcloud
@@ -12,3 +11,4 @@ seaborn
 tqdm
 faiss-cpu
 streamlit
+hf_xet

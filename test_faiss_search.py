@@ -1,132 +1,194 @@
 import argparse
 import json
+import math
 import random
-import pickle
 from pathlib import Path
 from typing import List, Tuple
 
 import numpy as np
 import faiss
-from sentence_transformers import SentenceTransformer, CrossEncoder
+import time
+
+from src.retriever.index import load_index, search, hybrid_search, load_embeddings, normalize_embeddings
+
+IndexID = Tuple[str, str, str]
 
 
-def load_embeddings(emb_path: Path, ids_path: Path) -> Tuple[List[Tuple[str,str,str]], np.ndarray]:
-    vecs = np.load(emb_path)
-    with open(ids_path, 'r', encoding='utf-8') as f:
-        ids = json.load(f)
-    if len(ids) != vecs.shape[0]:
-        raise ValueError(f"Length mismatch: {len(ids)} ids vs {vecs.shape[0]} embeddings")
-    return ids, vecs
+def recall_at_k(true_ids: List[IndexID], pred_ids: List[IndexID], k: int):
+    return int(true_ids[0] in pred_ids[:k])
 
+def paper_recall_at_k(true_ids: List[IndexID], pred_ids: List[IndexID], k: int):
+    true_paper = true_ids[0][0]
+    return int(any(pid[0] == true_paper for pid in pred_ids[:k]))
 
-def normalize(v: np.ndarray) -> np.ndarray:
-    norms = np.linalg.norm(v, axis=1, keepdims=True)
-    return v / np.clip(norms, 1e-12, None)
+def precision_at_k(true_ids: List[IndexID], pred_ids: List[IndexID], k: int):
+    # fraction of top-k that match the true paper
+    true_paper = true_ids[0][0]
+    hits = sum(1 for pid in pred_ids[:k] if pid[0] == true_paper)
+    return hits / k
 
+def reciprocal_rank(true_ids: List[IndexID], pred_ids: List[IndexID]):
+    true_paper = true_ids[0][0]
+    for rank, pid in enumerate(pred_ids, start=1):
+        if pid[0] == true_paper:
+            return 1.0 / rank
+    return 0.0
 
-def load_index(index_path: Path) -> faiss.Index:
-    return faiss.read_index(str(index_path))
+def ndcg_at_k(
+    true_ids: List[IndexID],
+    pred_ids: List[IndexID],
+    k: int
+) -> float:
+    true_paper = true_ids[0][0]
 
+    # 1) Collecting relevance in predictions
+    rels = [1.0 if pid[0] == true_paper else 0.0
+            for pid in pred_ids[:k]]
 
-def search(index: faiss.Index, queries: np.ndarray, top_k: int) -> Tuple[np.ndarray, np.ndarray]:
-    return index.search(queries, top_k)
+    # 2) DCG
+    dcg = 0.0
+    for i, rel in enumerate(rels, start=1):
+        dcg += rel / math.log2(i + 1)
 
+    # 3) IDCG: equal to the sum of the first R positions, where R = sum(rels)
+    R = int(sum(rels))
+    idcg = sum(1.0 / math.log2(i + 1) for i in range(1, R + 1))
 
-def hybrid_search(
-    index: faiss.Index,
-    ids: List[Tuple[str,str,str]],
-    queries: np.ndarray,
-    chunks_file: Path,
-    rerank_model: str,
-    top_k_coarse: int,
-    top_k: int
-) -> List[List[Tuple[Tuple[str,str,str], float]]]:
-    # load chunk texts
-    chunk_texts = {}
-    with open(chunks_file, 'r', encoding='utf-8') as f:
-        for line in f:
-            pid, sec, cid, txt = json.loads(line)
-            chunk_texts[(pid, sec, cid)] = txt
-    reranker = CrossEncoder(rerank_model)
-    D_coarse, I_coarse = index.search(queries, top_k_coarse)
-    results = []
-    for scores, idxs in zip(D_coarse, I_coarse):
-        cands = [ids[i] for i in idxs]
-        texts = [chunk_texts[c] for c in cands]
-        pairs = [("", t) for t in texts]
-        rerank_scores = reranker.predict(pairs)
-        ranked = sorted(zip(cands, rerank_scores), key=lambda x: x[1], reverse=True)
-        results.append(ranked[:top_k])
-    return results
+    return dcg / idcg if idcg > 0 else 0.0
 
-
-def evaluate_recall(
-    ids: List[Tuple[str,str,str]],
+def evaluate_flat(
+    ids: List[IndexID],
     vecs: np.ndarray,
     index: faiss.Index,
     sample_size: int,
     top_k: int
-) -> Tuple[float, float]:
+):
     N = vecs.shape[0]
     idxs = random.sample(range(N), min(sample_size, N))
-    exact_hits = 0
-    paper_hits = 0
+    rec_exact, rec_paper, prec, mrr, ndcg = 0, 0, 0.0, 0.0, 0.0
+    t_search = 0.0
+
     for i in idxs:
-        q = vecs[i:i+1]
-        D, I = index.search(q, top_k)
-        returned = I[0]
-        true_id = ids[i]
-        true_paper = true_id[0]
-        if any(ids[j] == true_id for j in returned):
-            exact_hits += 1
-        if any(ids[j][0] == true_paper for j in returned):
-            paper_hits += 1
-    return exact_hits / len(idxs), paper_hits / len(idxs)
+        q = vecs[i : i + 1]
+        true = [ids[i]]
+        t0 = time.time()
+        results = search(index, ids, q, top_k)
+        t_search += time.time() - t0
+        preds = [pid for pid, _ in results[0]]
+
+        rec_exact += recall_at_k(true, preds, top_k)
+        rec_paper += paper_recall_at_k(true, preds, top_k)
+        prec    += precision_at_k(true, preds, top_k)
+        mrr     += reciprocal_rank(true, preds)
+        ndcg    += ndcg_at_k(true, preds, top_k)
+
+    n = len(idxs)
+    return {
+        "recall@{}".format(top_k): rec_exact / n,
+        "paper_recall@{}".format(top_k): rec_paper / n,
+        "precision@{}".format(top_k): prec / n,
+        "MRR@{}".format(top_k): mrr / n,
+        "nDCG@{}".format(top_k): ndcg / n,
+        "avg_search_time": t_search / n
+    }
+
+
+def evaluate_hybrid(
+    ids: List[IndexID],
+    vecs: np.ndarray,
+    index: faiss.Index,
+    chunks_path: Path,
+    rerank_model: str,
+    sample_size: int,
+    top_k_coarse: int,
+    top_k: int
+):
+    N = vecs.shape[0]
+    idxs = random.sample(range(N), min(sample_size, N))
+    rec_exact, rec_paper, prec, mrr, ndcg = 0, 0, 0.0, 0.0, 0.0
+    t_coarse, t_rerank = 0.0, 0.0
+
+    for i in idxs:
+        qvec = vecs[i : i + 1]
+        true = [ids[i]]
+
+        # coarse
+        t0 = time.time()
+        D_r, _ = index.search(qvec, top_k_coarse)
+        t_coarse += time.time() - t0
+
+        # hybrid (using our function)
+        t0 = time.time()
+        results = hybrid_search(
+            coarse_idx=index,
+            ids=ids,
+            queries=qvec,
+            query_texts=[true[0][0]],
+            chunks_path=chunks_path,
+            rerank_model=rerank_model,
+            top_k_coarse=top_k_coarse,
+            top_k=top_k
+        )
+        t_rerank += time.time() - t0
+
+        preds = [pid for pid, _ in results[0]]
+
+        rec_exact += recall_at_k(true, preds, top_k)
+        rec_paper += paper_recall_at_k(true, preds, top_k)
+        prec    += precision_at_k(true, preds, top_k)
+        mrr     += reciprocal_rank(true, preds)
+        ndcg    += ndcg_at_k(true, preds, top_k)
+
+    n = len(idxs)
+    return {
+        "recall@{}".format(top_k): rec_exact / n,
+        "paper_recall@{}".format(top_k): rec_paper / n,
+        "precision@{}".format(top_k): prec / n,
+        "MRR@{}".format(top_k): mrr / n,
+        "nDCG@{}".format(top_k): ndcg / n,
+        "avg_coarse_time": t_coarse / n,
+        "avg_rerank_time": t_rerank / n
+    }
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Test FAISS search quality")
+    parser = argparse.ArgumentParser(description="Evaluate FAISS retrieval")
     parser.add_argument("--embeddings", type=Path, required=True)
-    parser.add_argument("--ids", type=Path, required=True)
-    parser.add_argument("--index", type=Path, required=True)
-    parser.add_argument("--mode", choices=["flat","hnsw","ivf","hybrid"], default="flat")
-    parser.add_argument("--chunks", type=Path, help="JSONL file for hybrid mode")
-    parser.add_argument("--rerank-model", type=str, default="cross-encoder/stsb-roberta-large")
-    parser.add_argument("--topk", type=int, default=5)
-    parser.add_argument("--topk-coarse", type=int, default=100)
-    parser.add_argument("--sample-size", type=int, default=1000)
+    parser.add_argument("--ids",        type=Path, required=True)
+    parser.add_argument("--index",      type=Path, required=True)
+    parser.add_argument("--chunks",     type=Path, help="JSONL for hybrid")
+    parser.add_argument("--rerank-model", type=str, default="cross-encoder/ms-marco-MiniLM-L-6-v2")
+    parser.add_argument("--mode", choices=["flat","hybrid"], default="flat")
+    parser.add_argument("--topk",       type=int, default=5)
+    parser.add_argument("--topk-coarse",type=int, default=100)
+    parser.add_argument("--sample-size",type=int, default=1000)
     args = parser.parse_args()
 
-    print("Loading embeddings and IDs...")
+    print("Load embeddings/ids …")
     ids, vecs = load_embeddings(args.embeddings, args.ids)
-    print(f"Loaded {len(ids)} vectors of dim {vecs.shape[1]}")
+    vecs = normalize_embeddings(vecs.astype("float32"))
 
-    print("Normalizing embeddings...")
-    vecs = normalize(vecs.astype('float32'))
+    print("Load index …")
+    dim = vecs.shape[1]
+    # If you're using an OPQ+IVF index, you may also need to pass use_opq=True
+    index, _ = load_index(str(args.index).split('.', 1)[0], dim)
 
-    print(f"Loading index from {args.index}...")
-    index = load_index(args.index)
-
-    print(f"Evaluating recall@{args.topk} on sample of {args.sample_size}... ")
-    ex, pap = evaluate_recall(ids, vecs, index, args.sample_size, args.topk)
-    print(f"Same-paper recall@{args.topk}: {pap:.3f}")
-
-    if args.mode == "hybrid":
-        if not args.chunks:
-            parser.error("--chunks is required for hybrid mode")
-        print("Running hybrid search on first query...")
-        hybrid = hybrid_search(
-            index, ids, vecs[:1], args.chunks, args.rerank_model,
-            args.topk_coarse, args.topk
-        )
-        print(hybrid)
+    if args.mode == "flat":
+        print(f"Evaluating flat retrieval @ topk={args.topk}")
+        metrics = evaluate_flat(ids, vecs, index, args.sample_size, args.topk)
     else:
-        print("Running simple search on first query...")
-        D, I = index.search(vecs[:1], args.topk)
-        results = []
-        for score, idx in zip(D[0], I[0]):
-            results.append((ids[idx], float(score)))
-        print(results)
+        if not args.chunks:
+            parser.error("--chunks required for hybrid")
+        print(f"Evaluating hybrid retrieval @ topk_coarse={args.topk_coarse}, topk={args.topk}")
+        metrics = evaluate_hybrid(
+            ids, vecs, index, args.chunks, args.rerank_model,
+            args.sample_size, args.topk_coarse, args.topk
+        )
+
+    print("\n=== Metrics ===")
+    for k,v in metrics.items():
+        print(f"{k:20s}: {v:.4f}")
+
 
 if __name__ == "__main__":
     main()
