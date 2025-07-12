@@ -50,6 +50,7 @@ class HFSummarizer:
             max_length=kwargs.get("max_length", 150),
             min_length=kwargs.get("min_length", 30),
             do_sample=kwargs.get("do_sample", False),
+            truncation=True,
         )
         return out[0]["summary_text"].strip()
 
