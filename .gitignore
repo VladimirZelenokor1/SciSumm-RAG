@@ -10,3 +10,8 @@ __pycache__/
 *.pyo
 *.pyd.
 kaggle.json
+cache/
+!/experiments/bart-finetune/
+/experiments/bart-finetune/**
+!/experiments/bart-finetune/*.csv
+!/experiments/bart-finetune/*.json

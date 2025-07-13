@@ -15,22 +15,29 @@ class HFSummarizer:
         chunk_overlap: int = 200,
     ):
         """
-        model_name: HF model for summarization (BART, T5, Pegasus, etc.)
-        device: -1 (CPU) or GPU number
-        max_input_len: max length of tokens that the model can
-        chunk_overlap: how many tokens to overlap between windows
+        model_name: HF model identifier (e.g. "facebook/bart-large-cnn")
+        OR local path to the directory with the saved model.
+        device: GPU index (0,1,...) or -1 for CPU.
+        max_input_len: maximum length of input (tokens).
+        chunk_overlap: number of tokens-overlaps between chunks.
         """
-        self.model_name = model_name or os.getenv(
-            "HF_SUMMARY_MODEL", "sshleifer/distilbart-cnn-12-6"
+        self.model_name = (
+            model_name
+            or os.getenv("HF_SUMMARY_MODEL", "sshleifer/distilbart-cnn-12-6")
         )
+
+        if os.path.isdir(self.model_name):
+            local_dir = self.model_name
+        else:
+            local_dir = None
 
         if device is None:
             device = 0 if torch.cuda.is_available() else -1
         self.device = device
 
         # pipeline
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-        self.model = AutoModelForSeq2SeqLM.from_pretrained(self.model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(local_dir or self.model_name)
+        self.model = AutoModelForSeq2SeqLM.from_pretrained(local_dir or self.model_name)
         self.summarizer = pipeline(
             "summarization",
             model=self.model,

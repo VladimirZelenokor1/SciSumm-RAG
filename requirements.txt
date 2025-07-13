@@ -12,3 +12,4 @@ tqdm
 faiss-cpu
 streamlit
 hf_xet
+evaluate

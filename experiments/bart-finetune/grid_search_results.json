@@ -1,0 +1,56 @@
+[
+  {
+    "config": {
+      "per_device_train_batch_size": 2,
+      "learning_rate": 3e-05,
+      "num_train_epochs": 3
+    },
+    "metrics": {
+      "eval_loss": 0.5679702162742615,
+      "eval_model_preparation_time": 0.0159,
+      "eval_rouge1": 26.873981608505847,
+      "eval_rouge2": 26.249885686580754,
+      "eval_rougeL": 27.115365414469274,
+      "eval_rougeLsum": 26.690916892325877,
+      "eval_runtime": 61.4515,
+      "eval_samples_per_second": 0.797,
+      "eval_steps_per_second": 0.407
+    }
+  },
+  {
+    "config": {
+      "per_device_train_batch_size": 2,
+      "learning_rate": 5e-05,
+      "num_train_epochs": 3
+    },
+    "metrics": {
+      "eval_loss": 0.5958621501922607,
+      "eval_model_preparation_time": 0.004,
+      "eval_rouge1": 29.13559987738091,
+      "eval_rouge2": 27.504058018163512,
+      "eval_rougeL": 28.56422119148138,
+      "eval_rougeLsum": 28.441399073578854,
+      "eval_runtime": 63.9061,
+      "eval_samples_per_second": 0.767,
+      "eval_steps_per_second": 0.391
+    }
+  },
+  {
+    "config": {
+      "per_device_train_batch_size": 2,
+      "learning_rate": 5e-05,
+      "num_train_epochs": 5
+    },
+    "metrics": {
+      "eval_loss": 0.6958604454994202,
+      "eval_model_preparation_time": 0.004,
+      "eval_rouge1": 80.43060405102347,
+      "eval_rouge2": 75.29879417746517,
+      "eval_rougeL": 77.60990780071073,
+      "eval_rougeLsum": 77.95026095934494,
+      "eval_runtime": 63.8708,
+      "eval_samples_per_second": 0.767,
+      "eval_steps_per_second": 0.391
+    }
+  }
+]

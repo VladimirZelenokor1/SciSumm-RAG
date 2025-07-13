@@ -2,15 +2,19 @@ import streamlit as st
 import faiss
 import json
 import numpy as np
+import pandas as pd
+import evaluate
 from pathlib import Path
 from src.retriever.embed import embed_texts
 from src.retriever.index import normalize_embeddings, hybrid_search
 from src.generator.hf_summarizer import HFSummarizer
 
 # Paths configuration
-DATA_DIR = Path("D:/SciSumm-RAG/data")
+ROOT = Path(__file__).resolve().parent
+DATA_DIR = ROOT / "data"
 INDEX_DIR = DATA_DIR / "index/faiss"
 CLEAN_DIR = DATA_DIR / "clean"
+FT_ROOT   = ROOT / "experiments" / "bart-finetune"
 
 # Available indexes mapping
 INDEX_OPTIONS = {
@@ -35,6 +39,23 @@ else:
 # Common slider for final Top-K
 top_k = st.sidebar.slider("Top-K Final Chunks:", 1, 20, 5)
 
+# Summarizer choice
+SUMMARIZERS = {"baseline": None}
+for cfg_dir in FT_ROOT.iterdir():
+    best = cfg_dir / "best-model"
+    if best.is_dir():
+        SUMMARIZERS[cfg_dir.name] = str(best)
+
+summ_choice = st.sidebar.selectbox(
+    "Choose summarizer:",
+    list(SUMMARIZERS.keys()),
+    index=0
+)
+
+@st.cache_resource
+def load_rouge():
+    return evaluate.load("rouge")
+
 @st.cache_resource
 def load_reranker(model_name: str):
     from sentence_transformers import CrossEncoder
@@ -57,14 +78,25 @@ def load_chunk_data():
     return chunk_keys, chunk_texts
 
 @st.cache_resource
-def load_summarizer():
-    return HFSummarizer(model_name=None, device=None)
+def load_summarizer(choice_key: str):
+    path = SUMMARIZERS[choice_key]
+    if path is None:
+        return HFSummarizer(model_name=None, device=None)
+    else:
+        return HFSummarizer(model_name=path, device=0)
 
-st.title("🔍 SciSumm-RAG Quick Demo")
+@st.cache_resource
+def load_references():
+    df = pd.read_csv(DATA_DIR / "clean" / "metadata_clean.csv")
+    return dict(zip(df["paper_id"], df["full_text"]))
+
+st.title("🔍 SciSumm-RAG: Demo")
 
 index_path = INDEX_OPTIONS[index_type]
 idx = load_index(index_path)
 chunk_keys, chunk_texts = load_chunk_data()
+ref_map    = load_references()
+rouge      = load_rouge()
 
 query = st.text_area("Enter a query or the text of an article:", height=200)
 
@@ -108,10 +140,29 @@ if st.button("Search and Summarize"):
         if key[0] == top_pid
     ]
     combined_text = "\n\n".join(passages)
-    summarizer = load_summarizer()
+    summarizer = load_summarizer(summ_choice)
     summary = summarizer.summarize(
         combined_text,
         max_length=150,
         min_length=30
     )
     st.write(summary)
+
+    st.subheader("📊 Rouge vs Reference Abstract")
+    ref = ref_map.get(top_pid, None)
+    if ref is not None:
+        scores = rouge.compute(
+            predictions=[summary],
+            references=[ref],
+            use_stemmer=True
+        )
+
+        scores = {k: v * 100 for k, v in scores.items()}
+        st.json({
+            "rouge1": round(scores["rouge1"], 2),
+            "rouge2": round(scores["rouge2"], 2),
+            "rougeL": round(scores["rougeL"], 2),
+        })
+    else:
+        st.warning(f"No reference abstract found for PID {top_pid}")
+
