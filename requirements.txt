@@ -13,3 +13,5 @@ faiss-cpu
 streamlit
 hf_xet
 evaluate
+pdfminer
+google-cloud-storage

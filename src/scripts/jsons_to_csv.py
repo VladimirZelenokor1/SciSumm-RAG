@@ -7,10 +7,10 @@ from pathlib import Path
 
 def jsons_to_csv(input_dir: Path, output_csv: Path):
     """
-    Проходит по всем .json в input_dir, пропускает те, у которых
-    body или abstract пусты, и пишет в CSV:
-      paper_id, body, abstract
-    где body и abstract — это объединённый в строки токенизированный текст.
+    Goes through all .json in input_dir, skips those with
+     body or abstract empty, and writes to CSV:
+     paper_id, body, abstract
+     where body and abstract are tokenized text merged into strings.
     """
     rows = []
     for fn in sorted(input_dir.glob("*.json")):
@@ -19,10 +19,10 @@ def jsons_to_csv(input_dir: Path, output_csv: Path):
         abs_tokens  = data.get("abstract", [])
 
         if not body_tokens or not abs_tokens:
-            # пропускаем неполные
+            # skip the incomplete ones
             continue
 
-        # Восстанавливаем строки: соединяем токены в предложения, предложения в текст
+        # Restore strings: connect tokens into sentences, sentences into text
         body_text = " ".join(" ".join(sent) for sent in body_tokens)
         abs_text  = " ".join(" ".join(sent) for sent in abs_tokens)
 
@@ -32,7 +32,7 @@ def jsons_to_csv(input_dir: Path, output_csv: Path):
             "abstract":  abs_text
         })
 
-    # Записываем CSV
+    # Write CSV
     with output_csv.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["paper_id", "body", "abstract"])
         writer.writeheader()
@@ -44,9 +44,9 @@ if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser(description="Convert processed JSONs to single CSV")
     p.add_argument("-i", "--input-dir",  default="data/processed",
-                   help="Папка с JSON-файлами")
+                   help="Folder with JSON files")
     p.add_argument("-o", "--output-csv", default="data/final_corpus.csv",
-                   help="Итоговый CSV с paper_id, body, abstract")
+                   help="Final CSV with paper_id, body, abstract")
     args = p.parse_args()
 
     jsons_to_csv(Path(args.input_dir), Path(args.output_csv))

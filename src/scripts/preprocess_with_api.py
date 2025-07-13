@@ -14,7 +14,7 @@ import nltk
 from nltk.corpus import stopwords
 from nltk.tokenize import sent_tokenize, word_tokenize
 
-# 1) Разовые загрузки моделей NLTK
+# 1) One-time downloads of NLTK models
 nltk.download("punkt", quiet=True)
 nltk.download("stopwords", quiet=True)
 STOP_WORDS = set(stopwords.words("english"))
@@ -22,8 +22,8 @@ STOP_WORDS = set(stopwords.words("english"))
 
 def fetch_abstract(paper_id: str) -> str:
     """
-    Запрашивает у arXiv API абстракт для данного paper_id (без версии),
-    возвращает чистый текст summary или "".
+    Queries the arXiv API for an abstract for a given paper_id (without version),
+ returns a plain text summary or "".
     """
     url = f"http://export.arxiv.org/api/query?id_list={paper_id}"
     resp = requests.get(url, timeout=10)
@@ -36,13 +36,13 @@ def fetch_abstract(paper_id: str) -> str:
 
 def clean_text(text: str) -> str:
     """
-    Очищает от:
-     - HTML-тэгов
-     - LaTeX-математики $...$
-     - LaTeX-команд \cmd{...}, фигурных скобок { }
-     - распространённых лигатур
-     - любых не-алфанумерических символов (оставляем пробел)
-     - нормализует пробелы
+    Clears from:
+     - HTML tags
+     - LaTeX math $...$
+     - LaTeX commands \cmd{...}, curly brackets { }
+     - common ligatures
+     - any non-alphanumeric characters (leave a space)
+     - normalizes spaces
     """
     # 1. strip HTML
     try:
@@ -86,8 +86,8 @@ def tokenize_normalize(text: str) -> list[list[str]]:
 
 def select_latest_versions(texts_dir: Path) -> dict[str, Path]:
     """
-    Сканирует texts_dir на *.txt, ищет файлы вида baseidvN.txt,
-    и возвращает словарь baseid -> путь к файлу с наибольшим N.
+    Scans texts_dir for *.txt, looks for files like baseidvN.txt,
+    and returns the dictionary baseid -> path to the file with the largest N.
     """
     candidates: dict[str, tuple[int, Path]] = {}
     for p in texts_dir.rglob("*.txt"):

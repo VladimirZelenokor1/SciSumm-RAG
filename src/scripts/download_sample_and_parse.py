@@ -2,9 +2,9 @@
 """
 scripts/download_sample_and_parse.py
 
-Скрипт выборочного скачивания и парсинга PDF-статей arXiv из GCS-бакета.
-Обрабатывает месяцы 2020–2025, берёт первые N PDF за месяц, скачивает их,
-парсит в текст и сохраняет локально, удаляя временные PDF.
+Script for selective downloading and parsing of arXiv PDF articles from the GCS package.
+Processes the months 2020-2025, takes the first N PDFs for the month, downloads them,
+parses them to text and saves them locally, removing temporary PDFs.
 """
 import argparse
 from pathlib import Path
@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 
 def download_and_parse(months, per_month, out_root, tmp_root):
-    # Создаём анонимный клиент для публичного бакета
+    # Create an anonymous client for the public bucket
     client = storage.Client.create_anonymous_client()
     bucket = client.bucket("arxiv-dataset")
 
@@ -26,7 +26,7 @@ def download_and_parse(months, per_month, out_root, tmp_root):
     for ym in months:
         print(f"\n>>> Processing {ym}, sampling {per_month} PDFs <<<")
         prefix = f"arxiv/arxiv/pdf/{ym}/"
-        # Получаем список объектов (blobs)
+        # Get a list of objects (blobs)
         blobs = list(bucket.list_blobs(prefix=prefix))
         if not blobs:
             print(f"No PDFs found for {ym}")
@@ -41,14 +41,14 @@ def download_and_parse(months, per_month, out_root, tmp_root):
             tmp_pdf = tmp_root / f"{pid}.pdf"
             txt_path = month_out / f"{pid}.txt"
 
-            # Пропустить, если текст уже есть
+            # Skip if text already exists
             if txt_path.exists():
                 continue
 
-            # Скачиваем PDF во временную папку
+            # Download the PDF to a temporary folder
             blob.download_to_filename(str(tmp_pdf))
 
-            # Парсим PDF в текст
+            # Parsing PDF to text
             try:
                 text = extract_text(str(tmp_pdf))
                 if text.strip():
@@ -58,7 +58,7 @@ def download_and_parse(months, per_month, out_root, tmp_root):
             except Exception as e:
                 print(f"Failed to parse {pid}: {e}")
             finally:
-                # Удаляем временный PDF
+                # Delete the temporary PDF
                 try:
                     tmp_pdf.unlink()
                 except OSError:
